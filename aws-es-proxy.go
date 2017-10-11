@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+  "crypto/rsa"
+  "crypto/tls"
+  "crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +21,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/aws/signer/v4"
+  "github.com/crewjam/saml/samlsp"
 )
 
 type proxy struct {
@@ -96,9 +100,20 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(err.Error()))
 	}
 
+//  check := func(user string, pass string) bool {
+    //return user == "Lex" && pass == "pass"
+  //}
+
 	endpoint := *r.URL
 	endpoint.Host = p.Host
 	endpoint.Scheme = p.Scheme
+
+  //user, pass, _ := r.BasicAuth()
+  //if !check(user, pass) {
+    //w.Header().Set("WWW-Authenticate", `Basic realm="DERP"`)
+    //http.Error(w, "Unauthorized", http.StatusUnauthorized)
+    //return
+  //}
 
 	req, err := http.NewRequest(r.Method, endpoint.String(), r.Body)
 	if err != nil {
@@ -179,14 +194,44 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func getSamlSP() *samlsp.Middleware {
+  keyPair, err := tls.LoadX509KeyPair("alexcool.cert", "alexcool.key")
+  if err != nil { panic(err) }
+
+  keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
+  if err != nil { panic(err) }
+
+  //idpMetadataURL, err := url.Parse("http://www.testshib.com/metadata/testshib-providers.xml")
+  idpMetadataURL, err := url.Parse("https://authenticate.visionlms.com")
+  if err != nil { panic(err) }
+
+  rootURL, err := url.Parse("http://localhost:8020")
+  if err != nil { panic(err) }
+
+  samlSP, _ := samlsp.New(samlsp.Options{
+    URL: *rootURL,
+    Key: keyPair.PrivateKey.(*rsa.PrivateKey),
+    Certificate: keyPair.Leaf,
+    IDPMetadataURL: idpMetadataURL,
+  })
+
+  return samlSP
+}
+
+func forwardToKibana(w http.ResponseWriter, r *http.Request) {
+  http.Redirect(w, r, r.RemoteAddr, 301)
+}
+
 func main() {
 	var endpoint, listenAddress string
 	var verbose bool
 	var prettify bool
 
+  samlSP := getSamlSP()
+
 	// TODO: Use a more sophisticated args parser that can enforce arguments
 	flag.StringVar(&endpoint, "endpoint", "", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
-	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
+	flag.StringVar(&listenAddress, "listen", "127.0.0.1:8020", "Local TCP port to listen on")
 	flag.BoolVar(&verbose, "verbose", false, "Print user requests")
 	flag.BoolVar(&prettify, "pretty", false, "Prettify verbose output")
 
@@ -209,5 +254,10 @@ func main() {
 	parseEndpoint(endpoint, mux)
 
 	fmt.Printf("Listening on %s\n", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, mux))
+  // forwarder := http.HandlerFunc(forwardToKibana)
+  //http.Handle("/_plugin/kibana/", samlSP.RequireAccount(forwarder))
+  http.Handle("/saml/", samlSP)
+  http.Handle("/_plugin/kibana/", samlSP.RequireAccount(mux))
+	//log.Fatal(http.ListenAndServe(listenAddress, samlSP.RequireAccount(mux)))
+  log.Fatal(http.ListenAndServe(listenAddress, nil))
 }
